@@ -1,0 +1,21 @@
+# systemd unit for the headless Linux build.
+#   sudo cp -r out/linux-x64 /opt/serverbrain
+#   sudo cp docs/serverbrain.service /etc/systemd/system/serverbrain@.service
+#   sudo systemctl enable --now serverbrain@youruser
+# Dashboard: http://127.0.0.1:7777   (names: http://<project>.localhost)
+[Unit]
+Description=Server Brain (local project manager) for %i
+After=network.target
+
+[Service]
+User=%i
+ExecStart=/opt/serverbrain/serverbrain
+Restart=on-failure
+RestartSec=3
+# lets the proxy bind port 80 without root; otherwise it falls back to 8080
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

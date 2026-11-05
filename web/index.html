@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <title>Server Brain</title>
+    <script>
+      // apply the last used theme before first paint (no dark/light flash)
+      try {
+        var t = JSON.parse(localStorage.getItem('sb.theme') || '{}');
+        var dark = t.theme === 'system' ? matchMedia('(prefers-color-scheme: dark)').matches : t.theme !== 'light';
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        if (t.accent) document.documentElement.dataset.accent = t.accent;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
