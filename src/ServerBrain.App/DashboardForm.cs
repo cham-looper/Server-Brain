@@ -79,7 +79,11 @@ internal sealed class DashboardForm : Form
             web.CoreWebView2.NewWindowRequested += (_, a) => { a.Handled = true; OpenExternal(a.Uri); };
             web.CoreWebView2.NavigationStarting += (_, a) =>
             {
-                if (Uri.TryCreate(a.Uri, UriKind.Absolute, out var u) && !ServerBrainHost.IsDashboardHost(u.Host)) { a.Cancel = true; OpenExternal(a.Uri); }
+                // Only the dashboard itself (same host AND port) may load in this window: it can pop native dialogs.
+                // Any other page, even http://127.0.0.1:<project port>, opens in the normal browser.
+                var isDashboard = Uri.TryCreate(a.Uri, UriKind.Absolute, out var u) && ServerBrainHost.IsDashboardHost(u.Host)
+                    && Uri.TryCreate(_url, UriKind.Absolute, out var self) && u.Port == self.Port;
+                if (!isDashboard && !a.Uri.StartsWith("about:", StringComparison.OrdinalIgnoreCase)) { a.Cancel = true; OpenExternal(a.Uri); }
             };
             web.CoreWebView2.WebMessageReceived += OnMessage;
             web.CoreWebView2.Navigate(_url + _pendingHash);

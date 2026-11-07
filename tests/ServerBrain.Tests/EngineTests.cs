@@ -74,6 +74,17 @@ public class DetectorTests
     }
 
     [Fact]
+    public void Batch_set_port_variable_is_detected()
+    {
+        var d = TestEnv.TempDir();
+        File.WriteAllText(Path.Combine(d, "start.bat"),
+            "@echo off\r\nrem change the port here\r\nset PORT=8788\r\nset OLLAMA_PORT=11500\r\necho Open http://127.0.0.1:%PORT%\r\n\".venv\\Scripts\\python.exe\" -m uvicorn app.server:app --host 127.0.0.1 --port %PORT%\r\n");
+        var s = Detector.Detect(d)!;
+        Assert.Equal(8788, s.Port);
+        Assert.DoesNotContain(s.Ports, p => p.Port == 11500);
+    }
+
+    [Fact]
     public void Php_and_static_projects_are_recognised()
     {
         var php = TestEnv.TempDir();
@@ -165,6 +176,42 @@ public class ProcessTests
         await runner.StopAsync();
         Assert.Equal(ProjectStatus.Stopped, runner.Status);
         Assert.All(pids, pid => Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid).Id));
+    }
+
+    [Fact]
+    public void Descendants_that_escaped_the_job_are_tracked_and_killed()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        // Models a launcher whose real server runs OUTSIDE the job (Microsoft Store Python, packaged apps):
+        // the pings are started before cmd.exe joins the job, so the job never contains them,
+        // yet they are still children of a job process.
+        using var container = ProcessContainer.Create();
+        using var root = Process.Start(new ProcessStartInfo("cmd.exe", "/d /c \"start /b ping -n 60 127.0.0.1 >nul & ping -n 60 127.0.0.1 >nul\"")
+            { UseShellExecute = false, CreateNoWindow = true })!;
+        Thread.Sleep(1200);
+        container.Add(root);
+
+        var ids = container.ProcessIds.ToList();
+        var escaped = ids.Where(p => p != root.Id).ToList();
+        Assert.Contains(root.Id, ids);
+        Assert.NotEmpty(escaped);                       // the pings are found by following parent links
+        Assert.True(container.HasLiveProcesses);
+
+        container.KillAll();
+        Assert.All(escaped, pid => Assert.True(WaitGone(pid), $"process {pid} survived KillAll"));
+        Assert.False(container.HasLiveProcesses);
+    }
+
+    private static bool WaitGone(int pid)
+    {
+        var until = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < until)
+        {
+            try { using var p = Process.GetProcessById(pid); if (p.HasExited) return true; }
+            catch (ArgumentException) { return true; }
+            Thread.Sleep(100);
+        }
+        return false;
     }
 
     [Fact]
@@ -319,6 +366,38 @@ public class StorageTests
         Assert.True(errs.Count >= 2);
         var (reserved, _) = mgr.Create(new ProjectInput { Id = "brain", Name = "brain", Path = dir, Command = "echo" });
         Assert.NotEqual("brain", reserved?.Config.Id);
+    }
+
+    [Fact]
+    public async Task Circular_start_dependencies_are_refused_and_cannot_overflow_the_stack()
+    {
+        var hub = new EventHub();
+        var mgr = new ProjectManager(hub, new ActivityLog(hub), new TunnelManager(new ActivityLog(hub), () => new AppSettings()), new SettingsService());
+        var dir = TestEnv.TempDir();
+        Assert.NotNull(mgr.Create(new ProjectInput { Id = "loop-a", Name = "A", Path = dir, Command = "echo a" }).view);
+        Assert.NotNull(mgr.Create(new ProjectInput { Id = "loop-b", Name = "B", Path = dir, Command = "echo b", DependsOn = new() { "loop-a" } }).view);
+
+        // closing the circle (a needs b, b needs a) is rejected when saving
+        var (view, errs) = mgr.Update("loop-a", new ProjectInput { Name = "A", Path = dir, Command = "echo a", DependsOn = new() { "loop-b" } });
+        Assert.Null(view);
+        Assert.Contains(errs, e => e.Contains("circle"));
+
+        // and even a loop that is already stored (hand-edited file) just starts instead of recursing forever
+        mgr.Find("loop-a")!.Config.DependsOn.Add("loop-b");
+        using var stopTicking = new CancellationTokenSource();
+        var ticker = Task.Run(async () =>      // stands in for the manager's heartbeat so "Starting" can resolve
+        {
+            while (!stopTicking.IsCancellationRequested)
+            {
+                foreach (var r in mgr.Runners()) r.Tick(DateTime.UtcNow, false);
+                await Task.Delay(100);
+            }
+        });
+        var res = await mgr.StartAsync("loop-a", "manual", force: true);
+        Assert.True(res.Ok);
+        stopTicking.Cancel();
+        await ticker;
+        await mgr.StopAllAsync();
     }
 
     [Fact]

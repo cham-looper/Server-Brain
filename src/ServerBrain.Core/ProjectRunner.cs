@@ -80,6 +80,17 @@ public sealed class ProjectRunner : IDisposable
         }
     }
 
+    public const string NoPortWarning =
+        "The project is running, but Server Brain found no web port for it. Set the port in the project settings (the one your app listens on).";
+
+    /// <summary>
+    /// True when the project is up but still has no web port after the whole startup window,
+    /// so the browser should be told so instead of waiting on a splash page forever.
+    /// </summary>
+    public bool PortSearchTimedOut =>
+        Status == ProjectStatus.Running && ActivePort is null &&
+        StartedAt is DateTime s && (DateTime.UtcNow - s).TotalSeconds > Math.Max(20, Config.StartupTimeoutSec);
+
     public void Touch() => LastActivity = DateTime.UtcNow;
 
     private int _activeRequests;
@@ -383,6 +394,12 @@ public sealed class ProjectRunner : IDisposable
                         }
                     }
                     else if (_portMissTicks != 0) { _portMissTicks = 0; if (Warning != null) { Warning = null; changed = true; } }
+                    else if (wanted == null)
+                    {
+                        // no port declared: say so when nothing was found, and clear it when the port shows up
+                        if (DetectedPort == null && Warning == null && elapsed > Math.Max(20, Config.StartupTimeoutSec)) { Warning = NoPortWarning; changed = true; }
+                        else if (DetectedPort != null && Warning == NoPortWarning) { Warning = null; changed = true; }
+                    }
                     if (elapsed > 60 && _consecutiveFailures > 0) _consecutiveFailures = 0;
                 }
 

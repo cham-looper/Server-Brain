@@ -316,6 +316,15 @@ public static class Detector
                 if (external || ExternalServicePorts.Contains(p)) continue;
                 Add(into, p, source, null, announce ? score : score - 25);
             }
+            // batch variable such as `set PORT=8788` or `set "APP_PORT=8788"`
+            var setVar = Regex.Match(line, @"^\s*@?set\s+""?([A-Za-z0-9_]*PORT[A-Za-z0-9_]*)=(\d{4,5})\b", RegexOptions.IgnoreCase);
+            if (setVar.Success && !external)
+            {
+                var upper = setVar.Groups[1].Value.ToUpperInvariant();
+                var p = int.Parse(setVar.Groups[2].Value);
+                if (!ExternalPortWords.Any(upper.Contains) && !ExternalServicePorts.Contains(p))
+                    Add(into, p, source, null, upper == "PORT" ? score : score - 10);
+            }
             foreach (Match m in Regex.Matches(line, @"(?:--port[ =]|-p\s+|--port=)(\d{4,5})\b"))
             {
                 var p = int.Parse(m.Groups[1].Value);

@@ -41,9 +41,40 @@ public static class ToolPath
         }
     }
 
-    public static void Invalidate() { lock (Gate) _cache = null; }
+    public static void Invalidate()
+    {
+        lock (Gate) _cache = null;
+        lock (StoreProbe) StoreProbe.Clear();
+    }
 
-    /// <summary>Full path of an executable/script on PATH, or null. Ignores the Microsoft Store "python" stubs.</summary>
+    private static readonly Dictionary<string, bool> StoreProbe = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// True when a python.exe under WindowsApps is a real Python (a Store install) and not the placeholder that only
+    /// opens the Microsoft Store. Asking it for its version tells them apart; the answer is remembered until <see cref="Invalidate"/>.
+    /// </summary>
+    private static bool StorePythonWorks(string exe)
+    {
+        lock (StoreProbe) if (StoreProbe.TryGetValue(exe, out var known)) return known;
+        var works = false;
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo(exe, "--version")
+                { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true });
+            if (p != null)
+            {
+                var output = p.StandardOutput.ReadToEndAsync();
+                _ = p.StandardError.ReadToEndAsync();
+                if (p.WaitForExit(5000)) works = p.ExitCode == 0 && output.GetAwaiter().GetResult().TrimStart().StartsWith("Python ", StringComparison.Ordinal);
+                else { try { p.Kill(true); } catch { } }
+            }
+        }
+        catch { }
+        lock (StoreProbe) StoreProbe[exe] = works;
+        return works;
+    }
+
+    /// <summary>Full path of an executable/script on PATH, or null. Ignores the Microsoft Store "python" placeholder when no Python is behind it.</summary>
     public static string? Find(params string[] names)
     {
         var exts = OperatingSystem.IsWindows() ? new[] { ".exe", ".cmd", ".bat" } : new[] { "" };
@@ -55,7 +86,8 @@ public static class ToolPath
                     {
                         var p = Path.Combine(dir, n + e);
                         if (!File.Exists(p)) continue;
-                        if (dir.Contains(@"\WindowsApps", StringComparison.OrdinalIgnoreCase) && n.StartsWith("python", StringComparison.OrdinalIgnoreCase)) continue; // Store stub
+                        // WindowsApps\python.exe is either a real Microsoft Store Python or only the stub that opens the Store.
+                        if (dir.Contains(@"\WindowsApps", StringComparison.OrdinalIgnoreCase) && n.StartsWith("python", StringComparison.OrdinalIgnoreCase) && !StorePythonWorks(p)) continue;
                         return p;
                     }
                     catch { }

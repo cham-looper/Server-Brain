@@ -78,6 +78,7 @@ public sealed class TunnelManager : IDisposable
 
         var args = new List<string> { "tunnel", "--no-autoupdate" };
         string? namedHost = null;
+        string? tunnelToken = null;
         if (project.Share.Mode == ShareMode.Quick)
         {
             if (proxyPort != null)
@@ -91,7 +92,10 @@ public sealed class TunnelManager : IDisposable
         {
             var token = Secrets.Unprotect(project.Share.TokenEnc);
             if (string.IsNullOrWhiteSpace(token)) { error = "No Cloudflare tunnel token saved for this project."; return false; }
-            args.AddRange(new[] { "run", "--token", token });
+            // The token goes in the environment (cloudflared reads TUNNEL_TOKEN), not on the command line,
+            // where any program on this PC could read it from the process list.
+            args.Add("run");
+            tunnelToken = token.Trim();
             namedHost = project.Share.Hostname?.Trim();
         }
 
@@ -101,6 +105,7 @@ public sealed class TunnelManager : IDisposable
             RedirectStandardOutput = true, RedirectStandardError = true,
         };
         foreach (var a in args) psi.ArgumentList.Add(a);
+        if (tunnelToken != null) psi.Environment["TUNNEL_TOKEN"] = tunnelToken;
 
         var t = new Tunnel { Hostname = namedHost, Info = new TunnelInfo { Status = "starting" } };
         try

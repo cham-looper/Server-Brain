@@ -36,6 +36,15 @@ public sealed class ProxyService
     public static bool IsPublicRequest(HttpRequest req) =>
         req.Headers.ContainsKey("Cf-Connecting-Ip") || req.Headers.ContainsKey("Cf-Ray") || req.Headers.ContainsKey("X-Forwarded-For");
 
+    /// <summary>The scheme the visitor really used: tunnel traffic arrives over plain http but is https for the visitor.</summary>
+    private static string PublicScheme(HttpRequest req)
+    {
+        if (!IsPublicRequest(req)) return req.Scheme;
+        var viaTunnel = req.Headers["Cf-Visitor"].ToString().Contains("\"https\"", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(req.Headers["X-Forwarded-Proto"].ToString().Split(',')[0].Trim(), "https", StringComparison.OrdinalIgnoreCase);
+        return viaTunnel ? "https" : req.Scheme;
+    }
+
     public async Task HandleAsync(HttpContext ctx)
     {
         var req = ctx.Request;
@@ -79,7 +88,10 @@ public sealed class ProxyService
         }
         if (r.Status == ProjectStatus.Starting || r.ActivePort is null)
         {
-            await WritePage(ctx, 200, Pages.Splash(cfg.Name, cfg.Color, isPublic), req);
+            if (r.PortSearchTimedOut)
+                await WritePage(ctx, 503, Pages.NoPort(cfg.Name, cfg.Color, isPublic), req);
+            else
+                await WritePage(ctx, 200, Pages.Splash(cfg.Name, cfg.Color, isPublic), req);
             return;
         }
 
@@ -110,7 +122,7 @@ public sealed class ProxyService
                 ctx.Response.ContentType = "application/json";
                 await ctx.Response.WriteAsync(JsonSerializer.Serialize(new
                 {
-                    status = r.Status, ready = r.Status == ProjectStatus.Running && r.ActivePort != null,
+                    status = r.Status, ready = r.Status == ProjectStatus.Running && r.ActivePort != null, noPort = r.PortSearchTimedOut,
                     error = isPublic ? null : r.Error, lines,
                 }, Json.Options));
                 return;
@@ -133,7 +145,7 @@ public sealed class ProxyService
                     ctx.Response.Cookies.Append(CookieName(cfg), Sign(cfg), new CookieOptions
                     {
                         HttpOnly = true, SameSite = SameSiteMode.Lax, MaxAge = TimeSpan.FromDays(7), Path = "/",
-                        Secure = (req.Headers["Cf-Visitor"].ToString().Contains("https") || req.Headers["X-Forwarded-Proto"] == "https"),
+                        Secure = PublicScheme(req) == "https",
                     });
                     ctx.Response.Redirect("/", false);
                     return;
@@ -222,8 +234,11 @@ public sealed class ProxyService
         {
             await base.TransformRequestAsync(ctx, proxyRequest, destinationPrefix, ct);
             proxyRequest.Headers.Host = $"127.0.0.1:{_port}";
+            // set (not append) so a visitor cannot smuggle their own forwarded host/proto to the project
+            proxyRequest.Headers.Remove("X-Forwarded-Host");
+            proxyRequest.Headers.Remove("X-Forwarded-Proto");
             proxyRequest.Headers.TryAddWithoutValidation("X-Forwarded-Host", _publicHost);
-            proxyRequest.Headers.TryAddWithoutValidation("X-Forwarded-Proto", ctx.Request.Scheme);
+            proxyRequest.Headers.TryAddWithoutValidation("X-Forwarded-Proto", PublicScheme(ctx.Request));
             if (!_rewrite) return;
             var origin = $"http://127.0.0.1:{_port}";
             if (proxyRequest.Headers.Contains("Origin")) { proxyRequest.Headers.Remove("Origin"); proxyRequest.Headers.TryAddWithoutValidation("Origin", origin); }
@@ -240,7 +255,7 @@ public sealed class ProxyService
             if (proxyResponse?.Headers.Location is Uri loc && _rewrite)
             {
                 if (loc.IsAbsoluteUri && loc.Port == _port && (loc.Host is "127.0.0.1" or "localhost" or "::1"))
-                    ctx.Response.Headers.Location = $"{ctx.Request.Scheme}://{_publicHost}{loc.PathAndQuery}";
+                    ctx.Response.Headers.Location = $"{PublicScheme(ctx.Request)}://{_publicHost}{loc.PathAndQuery}";
             }
             return ok;
         }

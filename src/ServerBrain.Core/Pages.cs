@@ -33,7 +33,7 @@ internal static class Pages
             <script>
             const msg=document.getElementById('msg'),log=document.getElementById('log');let n=0;
             async function poll(){try{const r=await fetch('/__sb/status',{cache:'no-store'});if(r.ok){const s=await r.json();
-              if(s.ready){location.reload();return}
+              if(s.ready||s.noPort){location.reload();return}
               if(log&&s.lines&&s.lines.length){log.hidden=false;log.textContent=s.lines.join('\n')}
               if(['crashed','failed','blocked'].includes(s.status)){msg.textContent=s.error||'The project could not start.';document.querySelector('.orb').classList.add('still');return}
             }}catch(e){}n++;setTimeout(poll,n<10?700:1500)}poll();
@@ -54,6 +54,13 @@ internal static class Pages
         return Shell($"{name} is not running",
             $"<div class=\"orb still\"></div><h1>{E(name)} is {E(status.ToLowerInvariant())}</h1><p>{msg}</p>{(canStart ? "<button id=\"b\">Start it</button>" : "")}{script}", color);
     }
+
+    public static string NoPort(string name, string? color, bool isPublic) => Shell($"{name} has no web port",
+        $"<div class=\"orb still\"></div><h1>{E(name)} is running</h1>" +
+        (isPublic
+            ? "<p>It is not answering yet. Please try again later.</p>"
+            : "<p>…but Server Brain could not find the web port it listens on. Open the project in the dashboard and set its port, then open this address again.</p>" +
+              "<button onclick=\"location.reload()\">Check again</button>"), color);
 
     public static string Gate(string name, string? error) => Shell($"{name} – access code",
         $"<div class=\"orb still\"></div><h1>{E(name)}</h1><p>Enter the access code you were given.</p>" +

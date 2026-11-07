@@ -274,7 +274,139 @@ internal sealed class WindowsJob : IProcessContainer
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr h);
 
+    // ---- descendants that escaped the job
+    // Some launchers start the real program OUTSIDE the job: the Microsoft Store flavour of Python
+    // (a venv built on it runs .venv\Scripts\python.exe, which starts the actual interpreter through the
+    // WindowsApps alias), other packaged apps, anything created with a breakaway flag. Such a process is
+    // still a descendant of ours, so we follow the parent links ourselves; otherwise its port is never
+    // attributed to the project (it is never "ready" and name.localhost shows the splash forever) and
+    // Stop would leave it running.
+    private const uint TH32CS_SNAPPROCESS = 0x2;
+    private const uint PROCESS_TERMINATE = 0x0001;
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    private const int STILL_ACTIVE = 259;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ProcessEntry
+    {
+        public uint dwSize, cntUsage, th32ProcessID;
+        public UIntPtr th32DefaultHeapID;
+        public uint th32ModuleID, cntThreads, th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool Process32FirstW(IntPtr snap, ref ProcessEntry e);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool Process32NextW(IntPtr snap, ref ProcessEntry e);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessTimes(IntPtr h, out long created, out long exited, out long kernel, out long user);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeProcess(IntPtr h, out int code);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr h, uint exitCode);
+
     private IntPtr _job;
+    private readonly object _escapedGate = new();
+    private readonly Dictionary<int, long> _escaped = new();   // pid -> creation time (guards against PID reuse)
+
+    /// <summary>Creation time of a live process, or 0 when it is gone or cannot be inspected.</summary>
+    private static long CreationTime(int pid, out bool alive)
+    {
+        alive = false;
+        var h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (h == IntPtr.Zero) return 0;
+        try
+        {
+            alive = GetExitCodeProcess(h, out var code) && code == STILL_ACTIVE;
+            return GetProcessTimes(h, out var created, out _, out _, out _) ? created : 0;
+        }
+        finally { CloseHandle(h); }
+    }
+
+    /// <summary>pid -> children, from one snapshot of the process table.</summary>
+    private static Dictionary<int, List<int>> ChildrenByParent()
+    {
+        var map = new Dictionary<int, List<int>>();
+        var snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return map;
+        try
+        {
+            var e = new ProcessEntry { dwSize = (uint)Marshal.SizeOf<ProcessEntry>() };
+            for (var ok = Process32FirstW(snap, ref e); ok; ok = Process32NextW(snap, ref e))
+            {
+                var pid = (int)e.th32ProcessID;
+                var parent = (int)e.th32ParentProcessID;
+                if (pid == 0 || parent == pid) continue;
+                if (!map.TryGetValue(parent, out var kids)) map[parent] = kids = new List<int>();
+                kids.Add(pid);
+            }
+        }
+        finally { CloseHandle(snap); }
+        return map;
+    }
+
+    /// <summary>
+    /// Adds every live descendant of the job's processes (and of earlier escapees) that is not itself in the
+    /// job to <see cref="_escaped"/>, and forgets the ones that have exited. Returns the live escapees.
+    /// </summary>
+    private List<int> SweepEscaped(IReadOnlyCollection<int> jobPids)
+    {
+        lock (_escapedGate)
+        {
+            foreach (var (pid, created) in _escaped.ToList())
+                if (CreationTime(pid, out var alive) != created || !alive) _escaped.Remove(pid);
+
+            if (jobPids.Count > 0 || _escaped.Count > 0)
+            {
+                var kidsOf = ChildrenByParent();
+                var known = new HashSet<int>(jobPids);
+                known.UnionWith(_escaped.Keys);
+                var queue = new Queue<int>(known);
+                while (queue.Count > 0)
+                {
+                    var parent = queue.Dequeue();
+                    if (!kidsOf.TryGetValue(parent, out var kids)) continue;
+                    var parentCreated = CreationTime(parent, out _);
+                    foreach (var kid in kids)
+                    {
+                        if (known.Contains(kid) || kid == Environment.ProcessId) continue;
+                        var created = CreationTime(kid, out var alive);
+                        // a child cannot be older than its parent: otherwise the PID was recycled
+                        if (!alive || created == 0 || (parentCreated != 0 && created < parentCreated)) continue;
+                        known.Add(kid);
+                        _escaped[kid] = created;
+                        queue.Enqueue(kid);
+                    }
+                }
+            }
+            return _escaped.Keys.ToList();
+        }
+    }
+
+    private void KillEscaped()
+    {
+        List<KeyValuePair<int, long>> victims;
+        lock (_escapedGate) { victims = _escaped.ToList(); _escaped.Clear(); }
+        foreach (var (pid, created) in victims)
+        {
+            if (pid <= 4 || pid == Environment.ProcessId) continue;
+            var h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (h == IntPtr.Zero) continue;
+            try
+            {
+                // only if it is still the very same process we recorded
+                if (GetProcessTimes(h, out var now, out _, out _, out _) && now == created) TerminateProcess(h, 1);
+            }
+            finally { CloseHandle(h); }
+        }
+    }
 
     public WindowsJob()
     {
@@ -297,7 +429,16 @@ internal sealed class WindowsJob : IProcessContainer
         return a;
     }
 
-    public bool HasLiveProcesses => _job != IntPtr.Zero && Query().ActiveProcesses > 0;
+    public bool HasLiveProcesses
+    {
+        get
+        {
+            if (_job == IntPtr.Zero) return false;
+            if (Query().ActiveProcesses > 0) return true;
+            // the job is empty, but a process that escaped it may still be serving
+            return SweepEscaped(Array.Empty<int>()).Count > 0;
+        }
+    }
 
     public TimeSpan TotalCpuTime
     {
@@ -309,36 +450,49 @@ internal sealed class WindowsJob : IProcessContainer
         }
     }
 
+    private List<int> JobProcessIds()
+    {
+        const int max = 512;
+        var len = 8 + IntPtr.Size * max;
+        var buf = Marshal.AllocHGlobal(len);
+        try
+        {
+            if (!QueryInformationJobObject(_job, 3, buf, len, IntPtr.Zero)) return new List<int>();
+            var n = Math.Min(Marshal.ReadInt32(buf, 4), max);
+            var ids = new List<int>(n);
+            for (var i = 0; i < n; i++) ids.Add((int)Marshal.ReadIntPtr(buf, 8 + i * IntPtr.Size));
+            return ids;
+        }
+        finally { Marshal.FreeHGlobal(buf); }
+    }
+
+    /// <summary>Everything the project runs: the job's processes plus descendants that escaped the job.</summary>
     public IReadOnlyList<int> ProcessIds
     {
         get
         {
             if (_job == IntPtr.Zero) return Array.Empty<int>();
-            const int max = 512;
-            var len = 8 + IntPtr.Size * max;
-            var buf = Marshal.AllocHGlobal(len);
-            try
-            {
-                if (!QueryInformationJobObject(_job, 3, buf, len, IntPtr.Zero)) return Array.Empty<int>();
-                var n = Marshal.ReadInt32(buf, 4);
-                var ids = new List<int>(n);
-                for (var i = 0; i < n; i++) ids.Add((int)Marshal.ReadIntPtr(buf, 8 + i * IntPtr.Size));
-                return ids;
-            }
-            finally { Marshal.FreeHGlobal(buf); }
+            var ids = JobProcessIds();
+            var escaped = SweepEscaped(ids);
+            if (escaped.Count > 0) ids.AddRange(escaped.Where(p => !ids.Contains(p)));
+            return ids;
         }
     }
 
     public void KillAll()
     {
-        if (_job != IntPtr.Zero) TerminateJobObject(_job, 1);
+        if (_job == IntPtr.Zero) return;
+        SweepEscaped(JobProcessIds());   // pick up anything started since the last heartbeat
+        TerminateJobObject(_job, 1);
+        KillEscaped();
     }
 
     public void Dispose()
     {
         if (_job == IntPtr.Zero) return;
-        CloseHandle(_job);   // KILL_ON_JOB_CLOSE finishes off anything still alive
+        CloseHandle(_job);   // KILL_ON_JOB_CLOSE finishes off anything still alive in the job
         _job = IntPtr.Zero;
+        KillEscaped();
     }
 }
 

@@ -249,7 +249,29 @@ public sealed class ProjectManager : IDisposable
             else if (Find(c.Id) != null) errs.Add($"A project named “{c.Id}” already exists.");
         }
         if (c.Share.Mode == ShareMode.Named && string.IsNullOrWhiteSpace(c.Share.Hostname)) errs.Add("Enter the public hostname for the named tunnel.");
+        var loop = FindDependencyLoop(c);
+        if (loop != null) errs.Add($"Projects cannot wait for each other in a circle ({loop}). Remove one of the “starts after” links.");
         return errs;
+    }
+
+    /// <summary>"a → b → a" when the dependencies of <paramref name="c"/> lead back to <paramref name="c"/>, otherwise null.</summary>
+    private string? FindDependencyLoop(ProjectConfig c)
+    {
+        List<string>? Walk(string id, List<string> path)
+        {
+            if (string.Equals(id, c.Id, StringComparison.OrdinalIgnoreCase) && path.Count > 0) return path;
+            if (path.Contains(id, StringComparer.OrdinalIgnoreCase)) return null;   // a loop that does not include c: not c's problem
+            var deps = string.Equals(id, c.Id, StringComparison.OrdinalIgnoreCase) ? c.DependsOn : Find(id)?.Config.DependsOn;
+            if (deps == null) return null;
+            foreach (var d in deps)
+            {
+                var found = Walk(d, new List<string>(path) { id });
+                if (found != null) return found;
+            }
+            return null;
+        }
+        var loop = Walk(c.Id, new List<string>());
+        return loop == null ? null : string.Join(" → ", loop.Append(c.Id));
     }
 
     public (ProjectView? view, List<string> errors) Create(ProjectInput input)
@@ -353,18 +375,21 @@ public sealed class ProjectManager : IDisposable
 
     // --------------------------------------------------------- start / stop
 
-    public async Task<StartResult> StartAsync(string id, string trigger = "manual", bool openWhenReady = false, bool force = false)
+    public async Task<StartResult> StartAsync(string id, string trigger = "manual", bool openWhenReady = false, bool force = false, HashSet<string>? chain = null)
     {
         var r = Find(id);
         if (r == null) return new StartResult(false, "Project not found.");
         if (r.IsUp) return new StartResult(true);
 
-        // dependencies first
+        // dependencies first; `chain` holds the projects being started right now so a dependency loop (A needs B, B needs A)
+        // can never recurse forever
+        chain ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        chain.Add(r.Config.Id);
         foreach (var depId in r.Config.DependsOn)
         {
             var dep = Find(depId);
-            if (dep == null || dep.IsUp) continue;
-            var res = await StartAsync(depId, "dependency", false, force);
+            if (dep == null || dep.IsUp || chain.Contains(depId)) continue;
+            var res = await StartAsync(depId, "dependency", false, force, chain);
             if (!res.Ok) return new StartResult(false, $"Dependency “{dep.Config.Name}” could not start: {res.Error}", res.Blocked, res.Conflicts);
             for (var i = 0; i < 60 && dep.Status == ProjectStatus.Starting; i++) await Task.Delay(1000);
         }
